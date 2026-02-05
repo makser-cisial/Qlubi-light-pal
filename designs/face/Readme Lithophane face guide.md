@@ -39,7 +39,7 @@ Enter the following settings exactly as listed below before uploading your image
 1. Upload an image of your choice.
 2. Adjust your image cropping and scaling so that the important parts of the image fit well within the defined square lithophane area.
 
-Users may use any image they like whoever simple, black and white images on a plain background are ideal for a clear uncluttered face.
+Users may use any image they like whoever simple, black and white images on a plain background are ideal for a clear uncluttered face. It is also ideal to centre one's image an not have details too close to the edges to ensure they are not obscured by the lip of the casing.
 
 ---
 
