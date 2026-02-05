@@ -1,4 +1,4 @@
-﻿# Qlubi Body Printing Guide
+﻿# Qlubi Body and Hats Printing Guide
 
 The Qlubi body is fully 3D printed and designed to be easily produced using the files included in this repository. Users may either print the entire body in one print or print individual parts separately to customise colours, materials, or finishes.
 
