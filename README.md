@@ -13,6 +13,8 @@ Qlubi network-based device designed to connect groups working and living separat
 
 The project is open source and designed to be customised and built upon, turning each Qlubi into someone’s made to be buddy.
 
+
+Watch the product video at: https://www.youtube.com/watch?v=_jfL0hginCQ
 ---
 
 ## Concept
