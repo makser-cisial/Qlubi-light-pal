@@ -70,7 +70,12 @@ Do not force excessively.
 
 # Step 3 — Assembling the Lolin S2 Mini
 
-Assemble your **Lolin S2 Mini** by soldering on the pin connectors, cutting off the excess from the button to ensure the board lies as flush as possible, then placing on the button in the correct orientation and then the LED wires accordingly going red, black green from the bottom right up.
+Assemble your **Lolin S2 Mini** by 
+1. soldering on the pin connectors
+2. cutting off the excess from the button to ensure the board lies as flush as possible
+3. place on the button in the correct orientation and then the LED wires accordingly going red, black green from the bottom right up
+
+![](https://github.com/makser-cisial/Qlubi-light-pal/blob/main/designs/images/parts.jpg)
 
 Ensure:
 
