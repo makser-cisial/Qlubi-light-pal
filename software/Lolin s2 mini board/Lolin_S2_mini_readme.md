@@ -46,6 +46,8 @@ If these values are not set correctly, the board will not connect to your networ
 
 Ensure each board has a unique identifier if running multiple devices.
 
+![](https://github.com/makser-cisial/Qlubi-light-pal/blob/main/software/Lolin%20s2%20mini%20board/images/what%20to%20change.png)
+
 ---
 
 # Step 3 — Upload the Code to the Board
