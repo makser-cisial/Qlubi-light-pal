@@ -1,5 +1,7 @@
 # Qlubi-light-pal
 
+A.M.D.G
+
 A desktop buddy who’s there to connect when you feel most alone
 
 Qlubi is a networked companion device that converts heart rate stress signals into anonymous light communication, enabling trusted groups to support each other remotely through subtle, non-verbal interaction.
