@@ -173,6 +173,8 @@ When sitting down to work:
 
 Qlubi will now monitor stress levels and activate alerts when thresholds are exceeded.
 
+The more Qlubis in one's network the better the device experience so feel free to set them up for friends and family
+
 ---
 
 # Troubleshooting Checklist
