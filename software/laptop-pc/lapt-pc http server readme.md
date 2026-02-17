@@ -49,7 +49,9 @@ Specifically update:
 - Port configuration (if applicable)
 - Any authentication keys or tokens
 
-Refer to the provided reference image in this repository to see where these fields are located in the code.
+Refer to the below reference image in this repository to see where these fields are located in the code.
+
+![](https://github.com/makser-cisial/Qlubi-light-pal/blob/main/software/laptop-pc/images/what%20to%20change.png)
 
 Failure to update these values will prevent proper communication between:
 
