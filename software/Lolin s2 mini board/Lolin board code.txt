@@ -1,0 +1,1399 @@
+import time
+import board
+import neopixel
+import digitalio
+import math
+import wifi
+import socketpool
+import adafruit_minimqtt.adafruit_minimqtt as MQTT
+import json
+import random
+
+# ============================================================================
+# USER CONFIGURATION - EDIT THESE SETTINGS FOR YOUR SYSTEM
+# ============================================================================
+SSID = "examplewifi"           # EDIT: Your WiFi network name
+PASSWORD = "examplepassword"   # EDIT: Your WiFi password (empty for open networks)
+MQTT_BROKER = "exampleserver"  # EDIT: Your MQTT server address
+MQTT_PORT = xxxx                 # EDIT: MQTT port (usually 1883 for non-SSL)
+
+# MQTT Topics - communication channels (keep consistent across all devices)
+MQTT_TOPIC_DISTRESS = "heartrate1/distressAlert"
+MQTT_TOPIC_PRESENCE = "heartrate1/presence"
+MQTT_TOPIC_ACKNOWLEDGE = "heartrate1/acknowledgeAlert"
+MQTT_TOPIC_POKE = "heartrate1/poke"
+MQTT_TOPIC_DISCOVERY = "heartrate1/discovery"
+
+# Device Identity - MUST BE UNIQUE FOR EACH DEVICE
+BOARD_ID = "exampleboard1"              # EDIT: Unique name for this physical board
+OWNER_DEVICE_ID = "examplemonitor1"  # EDIT: ID of the heart monitor this board belongs to
+
+# LED Configuration
+NUM_LEDS = 8                      # Number of LEDs in your NeoPixel ring
+PIN = board.IO16                  # EDIT: GPIO pin connected to LEDs (change if needed)
+BRIGHTNESS = 0.9                  # LED brightness (0.0 to 1.0)
+
+# Pre-defined colors for different system states
+FRIEND_DISTRESS_COLOR = (255, 80, 0, 0)      # Red-orange for others' distress
+WARM_BLUE = (0, 140, 255, 0)                 # Base color when idle
+VIBRANT_GREEN = (120, 220, 60, 0)            # Success/connection color
+FRIEND_RESPONSE_COLOR = (255, 100, 255, 0)    # Bright magenta-purple
+NO_RESPONSE_MODE_COLOR = (255, 140, 100, 0)  # Soft coral when no one responds
+POKE_COLOR = (255, 50, 150, 0)               # Pink for poke interactions
+NO_DEVICE_COLOR = (255, 0, 0, 0)             # Red for error/no devices
+SOFT_WHITE = (40, 40, 40, 15)                # Soft white for startup
+WARM_YELLOW = (255, 200, 0, 0)               # Warm yellow for notifications
+SOFT_GREEN = (60, 200, 80, 5)                 # Soft green for device pulses
+
+# Startup colors
+STARTUP_WHITE = (60, 60, 60, 20)
+WIFI_CONNECTING_BLUE = (0, 80, 160, 5)
+WIFI_CONNECTED_BLUE = (0, 100, 200, 10)
+SERVER_CONNECTING_GREEN = (60, 180, 80, 5)
+SERVER_CONNECTED_GREEN = (80, 220, 100, 10)
+WARM_BASE_BLUE = (30, 100, 180, 15)
+
+# Mode constants - used throughout the system
+FRIEND_DISTRESS, FRIEND_RESPONSE, NO_RESPONSE, POKE, DEFAULT = 0, 1, 2, 3, 4
+
+# Timing constants - adjust these to change system behavior
+DEBOUNCE_TIME = 0.2               # Button debounce delay
+MQTT_CHECK_INTERVAL = 0.5         # How often to check for MQTT messages
+PRESENCE_INTERVAL = 300           # Send "I'm alive" message every 5 minutes
+MAIN_LOOP_DELAY = 0.05            # Main loop delay for smooth animations
+POKE_TIMEOUT = 3.0                # Poke animation duration
+POKE_COOLDOWN = 2.0               # Delay between pokes
+RECONNECT_INTERVAL = 10.0         # Wait 10 seconds between reconnection attempts
+DISTRESS_TIMEOUT = 30.0           # EDIT: How long to wait for help before giving up (seconds)
+DISCOVERY_TIMEOUT = 3.0           # How long to wait for discovery responses
+
+# Startup transition timing
+STARTUP_FADE_DURATION = 1.5
+STARTUP_HOLD_DURATION = 0.8
+
+# Pulse animation timing
+POKE_PULSE_DURATION = 1.0
+POKE_PULSE_COUNT = 3
+POKE_PULSE_GAP = 0.67
+
+NO_DEVICE_PULSE_DURATION = 0.6
+NO_DEVICE_PULSE_COUNT = 2
+NO_DEVICE_PULSE_GAP = 0.3
+
+DEVICE_PULSE_DURATION = 0.8
+DEVICE_PULSE_GAP = 0.4
+
+# ============================================================================
+# BUTTON MANAGER - Handles physical button input
+# ============================================================================
+class ButtonManager:
+    def __init__(self):
+        # EDIT: Change these pins if your buttons are connected differently
+        self.button_onboard = digitalio.DigitalInOut(board.IO0)   # Onboard button
+        self.button_external = digitalio.DigitalInOut(board.IO18) # External button
+        # Configure both buttons with pull-up resistors
+        self.button_onboard.direction = digitalio.Direction.INPUT
+        self.button_onboard.pull = digitalio.Pull.UP
+        self.button_external.direction = digitalio.Direction.INPUT
+        self.button_external.pull = digitalio.Pull.UP
+        
+        # Button state tracking
+        self.last_press = 0
+        self.last_onboard = True
+        self.last_external = True
+        self.press_detected = False
+
+    def check_press(self):
+        """Check for button presses with debouncing"""
+        now = time.monotonic()
+        pressed = False
+
+        # Check both buttons for press events
+        onboard_pressed = not self.button_onboard.value and self.last_onboard
+        external_pressed = not self.button_external.value and self.last_external
+
+        # Register press if either button is pressed and debounce time has passed
+        if (onboard_pressed or external_pressed) and (now - self.last_press) > DEBOUNCE_TIME:
+            pressed = True
+            self.last_press = now
+            self.press_detected = True
+
+        # Update previous states for edge detection
+        self.last_onboard = self.button_onboard.value
+        self.last_external = self.button_external.value
+
+        return pressed
+    
+    def get_press_detected(self):
+        """Get and clear the press detected flag"""
+        if self.press_detected:
+            self.press_detected = False
+            return True
+        return False
+
+# ============================================================================
+# LED MANAGER - Controls all LED animations (ALL LEDs SYNCHRONIZED)
+# ============================================================================
+class LEDManager:
+    def __init__(self):
+        # Initialize NeoPixel ring - EDIT PIN if using different GPIO
+        self.pixels = neopixel.NeoPixel(
+            PIN, NUM_LEDS, brightness=BRIGHTNESS,
+            auto_write=False, bpp=4, pixel_order=neopixel.GRBW
+        )
+        
+        # Current system mode
+        self.current_mode = DEFAULT
+        self.animation_time = 0
+
+        # Pre-compute patterns
+        self._init_patterns()
+
+        # Blip animation state
+        self.blip_active = False
+        self.blip_start = 0
+        self.blip_color = None
+        self.blip_duration = 0
+        self.blip_sequence = []
+        self.blip_sequence_index = 0
+
+        # Fade animation state
+        self.fade_active = False
+        self.fade_start = 0
+        self.fade_duration = 0
+        self.fade_to_mode = None
+        self.fade_from_color = None
+        self.fade_to_color = None
+
+        # Pulse animation state
+        self.pulse_active = False
+        self.pulse_start = 0
+        self.pulse_color = None
+        self.pulse_count = 0
+        self.pulse_duration = 0
+        self.pulse_gap = 0
+
+        # Startup animation state
+        self.startup_active = False      # True when we're in startup sequence
+        self.startup_phase = 0           # Current phase (0-6)
+        self.startup_progress = 0        # Animation progress (0-1)
+        self.startup_hold_timer = 0      # Timer for holding at peak color
+
+        # Distress timeout tracking
+        self.distress_start_time = 0
+        self.no_response_alert_active = False
+        
+        # Device pulse tracking
+        self.device_pulse_active = False
+        self.device_pulse_start = 0
+        self.device_pulse_count = 0
+
+        # No-response mode counter
+        self.no_response_counter = 0
+
+        # Track if this board initiated a distress
+        self.owner_distress_active = False
+
+    def _init_patterns(self):
+        """Pre-compute animation parameters"""
+        self.mode_colors = [
+            FRIEND_DISTRESS_COLOR,    # Mode 0: Friend distress
+            FRIEND_RESPONSE_COLOR,    # Mode 1: Friend response
+            NO_RESPONSE_MODE_COLOR,   # Mode 2: No response
+            POKE_COLOR,               # Mode 3: Poke
+            WARM_BASE_BLUE             # Mode 4: Default
+        ]
+
+        # Pulse speeds for each mode (higher = faster/more urgent)
+        self.mode_speeds = [
+            4.0,  # Distress - FAST URGENT pulsing
+            2.0,  # Response - Medium pace
+            1.2,  # No Response - Slow, gentle breathing
+            3.0,  # Poke - Quick, playful pulses
+            0.8   # Default - Very slow, barely perceptible pulse
+        ]
+
+    def update(self, dt):
+        """Update all animations - called once per frame"""
+        self.animation_time += dt
+
+        # Handle animations in priority order
+        if self.fade_active:
+            self._update_fade()
+            return
+            
+        if self.pulse_active:
+            self._update_pulse()
+            return
+
+        if self.device_pulse_active:
+            self._update_device_pulse()
+            return
+
+        # STARTUP ANIMATION HAS HIGH PRIORITY - shows connection progress
+        if self.startup_active:
+            self._update_startup_animation()
+            return
+
+        if self.blip_active or self.blip_sequence:
+            self._update_blip()
+            return
+
+        # Always update main mode animation
+        self._update_mode_animation()
+
+    def _update_fade(self):
+        """Non-blocking fade between colors"""
+        elapsed = time.monotonic() - self.fade_start
+        progress = min(1.0, elapsed / self.fade_duration)
+
+        if progress >= 1.0:
+            # Fade complete
+            self.fade_active = False
+            if self.fade_to_mode is not None:
+                self.current_mode = self.fade_to_mode
+            return
+
+        # Simple linear fade between colors
+        current_color = []
+        for i in range(4):
+            value = int(self.fade_from_color[i] * (1 - progress) +
+                       self.fade_to_color[i] * progress)
+            current_color.append(value)
+
+        self.pixels.fill(tuple(current_color))
+        self.pixels.show()
+
+    def _update_pulse(self):
+        """Smooth pulse animation - all LEDs synchronized"""
+        elapsed = time.monotonic() - self.pulse_start
+
+        # Calculate total cycle time (pulse + gap)
+        cycle_time = self.pulse_duration + self.pulse_gap
+
+        # Check if animation should end
+        completed_cycles = int(elapsed / cycle_time)
+        if completed_cycles >= self.pulse_count:
+            self.pulse_active = False
+            self.set_mode(DEFAULT, fade=True)
+            return
+
+        # Calculate position in current cycle
+        cycle_pos = elapsed % cycle_time
+
+        if cycle_pos < self.pulse_duration:
+            # In pulse phase - smooth 0→100→0 sine wave
+            pulse_progress = cycle_pos / self.pulse_duration
+            intensity = math.sin(pulse_progress * math.pi)
+            
+            # Apply intensity to pulse color
+            pulse_color = tuple(int(c * intensity) for c in self.pulse_color)
+            self.pixels.fill(pulse_color)
+            self.pixels.show()
+        else:
+            # In gap phase - show near-zero
+            base_color = tuple(int(c * 0.1) for c in self.mode_colors[DEFAULT])
+            self.pixels.fill(base_color)
+            self.pixels.show()
+
+    def _update_device_pulse(self):
+        """Soft green pulse animation for device counting"""
+        elapsed = time.monotonic() - self.device_pulse_start
+
+        cycle_time = DEVICE_PULSE_DURATION + DEVICE_PULSE_GAP
+        cycle_pos = elapsed % cycle_time
+
+        if cycle_pos < DEVICE_PULSE_DURATION:
+            pulse_progress = cycle_pos / DEVICE_PULSE_DURATION
+            intensity = math.sin(pulse_progress * math.pi)
+            pulse_color = tuple(int(c * intensity) for c in SOFT_GREEN)
+            self.pixels.fill(pulse_color)
+            self.pixels.show()
+        else:
+            base_color = tuple(int(c * 0.1) for c in self.mode_colors[DEFAULT])
+            self.pixels.fill(base_color)
+            self.pixels.show()
+
+        cycles_completed = int(elapsed / cycle_time)
+        if cycles_completed >= self.device_pulse_count:
+            self.device_pulse_active = False
+            self.set_mode(DEFAULT, fade=True)
+
+    def _update_startup_animation(self):
+        """
+        Smooth startup animation that automatically progresses through phases.
+        Each phase: fade in (1.5s) -> hold (0.8s) -> next phase
+        """
+        elapsed = time.monotonic() - self.fade_start
+        
+        # Calculate fade progress (0 to 1)
+        progress = min(1.0, elapsed / self.fade_duration)
+        self.startup_progress = progress
+
+        if progress >= 1.0:
+            # Fade is complete - now we're in the hold period
+            if self.startup_hold_timer == 0:
+                # Just finished fading, start the hold timer
+                self.startup_hold_timer = time.monotonic()
+                return
+            
+            # Check if hold duration has elapsed
+            hold_elapsed = time.monotonic() - self.startup_hold_timer
+            if hold_elapsed >= STARTUP_HOLD_DURATION:
+                # Hold complete - time to move to next phase
+                if self.startup_phase < 6:
+                    # Move to next phase (increment phase and restart fade)
+                    self.startup_phase += 1
+                    self._apply_startup_phase()  # Set up colors for new phase
+                else:
+                    # Reached phase 6 - end of startup sequence
+                    self.startup_active = False
+                    self.current_mode = DEFAULT
+            return
+
+        # Still fading - interpolate between from_color and to_color
+        current_color = []
+        for i in range(4):
+            value = int(self.fade_from_color[i] * (1 - progress) +
+                       self.fade_to_color[i] * progress)
+            current_color.append(value)
+
+        self.pixels.fill(tuple(current_color))
+        self.pixels.show()
+
+    def _apply_startup_phase(self):
+        """
+        Apply the current startup phase colors and restart fade.
+        This is called when entering a new phase or when update_startup_phase() is called externally.
+        """
+        self.startup_hold_timer = 0  # Reset hold timer
+        self.fade_start = time.monotonic()  # Start new fade
+        self.fade_duration = STARTUP_FADE_DURATION
+
+        # Set colors based on current phase
+        if self.startup_phase == 0:  # Initial white (phase 0)
+            self.fade_from_color = STARTUP_WHITE
+            self.fade_to_color = STARTUP_WHITE
+        elif self.startup_phase == 1:  # WiFi connecting
+            self.fade_from_color = STARTUP_WHITE
+            self.fade_to_color = WIFI_CONNECTING_BLUE
+        elif self.startup_phase == 2:  # WiFi connected
+            self.fade_from_color = WIFI_CONNECTING_BLUE
+            self.fade_to_color = WIFI_CONNECTED_BLUE
+        elif self.startup_phase == 3:  # Server connecting
+            self.fade_from_color = WIFI_CONNECTED_BLUE
+            self.fade_to_color = SERVER_CONNECTING_GREEN
+        elif self.startup_phase == 4:  # Server connected
+            self.fade_from_color = SERVER_CONNECTING_GREEN
+            self.fade_to_color = SERVER_CONNECTED_GREEN
+        elif self.startup_phase == 5:  # Warm base color
+            self.fade_from_color = SERVER_CONNECTED_GREEN
+            self.fade_to_color = WARM_BASE_BLUE
+        elif self.startup_phase == 6:  # Transition to default mode
+            self.fade_from_color = WARM_BASE_BLUE
+            self.fade_to_color = self.mode_colors[DEFAULT]
+            # Note: startup_active will be set to False when phase 6 completes
+
+    def _update_blip(self):
+        """Non-blocking blip animation - all LEDs synchronized"""
+        if self.blip_sequence and not self.blip_active:
+            self.blip_color, self.blip_duration = self.blip_sequence[self.blip_sequence_index]
+            self.blip_active = True
+            self.blip_start = time.monotonic()
+
+        if self.blip_active:
+            elapsed = time.monotonic() - self.blip_start
+            progress = min(1.0, elapsed / self.blip_duration)
+
+            if progress >= 1.0:
+                self.blip_active = False
+                self.blip_sequence_index += 1
+                if self.blip_sequence_index >= len(self.blip_sequence):
+                    self.blip_sequence = []
+                    self.blip_sequence_index = 0
+                return
+
+            intensity = math.sin(progress * math.pi)
+            if self.blip_color == (0, 0, 0, 0):
+                intensity = 0.1
+            else:
+                intensity = (intensity + 1.0) / 2.0 * 0.9
+
+            blip_color = tuple(int(c * intensity) for c in self.blip_color)
+            self.pixels.fill(blip_color)
+            self.pixels.show()
+
+    def _update_mode_animation(self):
+        """Main mode animation - ALL LEDs SYNCHRONIZED with simple pulsing"""
+        mode = self.current_mode
+        speed = self.mode_speeds[mode]
+
+        if mode == FRIEND_DISTRESS:
+            if self.owner_distress_active:
+                # Owner's board in distress - show DEFAULT (no visual alarm)
+                self.pixels.fill(self.mode_colors[DEFAULT])
+                self.pixels.show()
+            else:
+                # Watching someone else's distress - FAST URGENT PULSING
+                raw_pulse = math.sin(self.animation_time * speed)
+                pulse = 0.2 + 0.8 * ((raw_pulse + 1.0) / 2.0)
+                
+                r = int(FRIEND_DISTRESS_COLOR[0] * pulse)
+                g = int(FRIEND_DISTRESS_COLOR[1] * pulse)
+                b = int(FRIEND_DISTRESS_COLOR[2] * pulse)
+                w = int(FRIEND_DISTRESS_COLOR[3] * pulse)
+                
+                self.pixels.fill((r, g, b, w))
+                self.pixels.show()
+
+        elif mode == FRIEND_RESPONSE:
+            raw_pulse = math.sin(self.animation_time * speed)
+            pulse = 0.3 + 0.7 * ((raw_pulse + 1.0) / 2.0)
+            
+            r = int(FRIEND_RESPONSE_COLOR[0] * pulse)
+            g = int(FRIEND_RESPONSE_COLOR[1] * pulse)
+            b = int(FRIEND_RESPONSE_COLOR[2] * pulse)
+            w = int(FRIEND_RESPONSE_COLOR[3] * pulse)
+            
+            self.pixels.fill((r, g, b, w))
+            self.pixels.show()
+
+        elif mode == NO_RESPONSE:
+            raw_pulse = math.sin(self.animation_time * speed)
+            pulse = 0.2 + 0.8 * ((raw_pulse + 1.0) / 2.0)
+            
+            r = int(NO_RESPONSE_MODE_COLOR[0] * pulse)
+            g = int(NO_RESPONSE_MODE_COLOR[1] * pulse)
+            b = int(NO_RESPONSE_MODE_COLOR[2] * pulse)
+            w = int(NO_RESPONSE_MODE_COLOR[3] * pulse)
+            
+            self.pixels.fill((r, g, b, w))
+            self.pixels.show()
+
+        elif mode == POKE:
+            raw_pulse = math.sin(self.animation_time * speed)
+            pulse = 0.3 + 0.7 * ((raw_pulse + 1.0) / 2.0)
+            
+            r = int(POKE_COLOR[0] * pulse)
+            g = int(POKE_COLOR[1] * pulse)
+            b = int(POKE_COLOR[2] * pulse)
+            w = int(POKE_COLOR[3] * pulse)
+            
+            self.pixels.fill((r, g, b, w))
+            self.pixels.show()
+
+        else:  # DEFAULT
+            raw_pulse = math.sin(self.animation_time * speed)
+            pulse = 0.7 + 0.3 * ((raw_pulse + 1.0) / 2.0)
+            
+            r = int(WARM_BASE_BLUE[0] * pulse)
+            g = int(WARM_BASE_BLUE[1] * pulse)
+            b = int(WARM_BASE_BLUE[2] * pulse)
+            w = int(WARM_BASE_BLUE[3] * pulse)
+            
+            self.pixels.fill((r, g, b, w))
+            self.pixels.show()
+
+    def set_mode(self, new_mode, fade=True):
+        """Change LED mode with optional smooth fade"""
+        if new_mode == self.current_mode:
+            return
+
+        if fade:
+            self.fade_active = True
+            self.fade_start = time.monotonic()
+            self.fade_duration = 0.5
+            self.fade_to_mode = new_mode
+            self.fade_from_color = self.mode_colors[self.current_mode]
+            self.fade_to_color = self.mode_colors[new_mode]
+        else:
+            self.current_mode = new_mode
+            self.pixels.fill(self.mode_colors[new_mode])
+            self.pixels.show()
+            
+        # Track when distress mode starts for timeout
+        if new_mode == FRIEND_DISTRESS:
+            self.distress_start_time = time.monotonic()
+            self.no_response_alert_active = False
+            self.no_response_counter = 0
+        elif new_mode == NO_RESPONSE:
+            self.no_response_counter = 0
+            self.owner_distress_active = False
+
+    def start_smooth_fade(self, from_color, to_color, duration=STARTUP_FADE_DURATION):
+        """Start a smooth fade between two colors"""
+        self.fade_active = True
+        self.fade_start = time.monotonic()
+        self.fade_duration = duration
+        self.fade_from_color = from_color
+        self.fade_to_color = to_color
+        self.fade_to_mode = None
+
+    def start_startup_sequence(self):
+        """Start the smooth startup sequence with phase 0 (white)"""
+        self.startup_active = True
+        self.startup_phase = 0
+        self.startup_hold_timer = 0
+        self._apply_startup_phase()  # Set up phase 0 colors
+        self.pixels.fill(STARTUP_WHITE)  # Immediate white
+        self.pixels.show()
+
+    def update_startup_phase(self, phase):
+        """
+        Update to next startup phase with smooth transition.
+        Called by MQTT manager when connection status changes.
+        
+        Args:
+            phase: The phase number to transition to (1-6)
+        """
+        if not self.startup_active:
+            return
+
+        # Only update if we're moving forward in phases
+        if phase > self.startup_phase:
+            self.startup_phase = phase
+            self._apply_startup_phase()  # Set up colors for new phase
+
+    def start_poke_animation(self):
+        """Start gentle pulse animation for poke interactions"""
+        if self.current_mode in (FRIEND_DISTRESS, FRIEND_RESPONSE, NO_RESPONSE):
+            print(f"Ignoring poke while in mode {self.current_mode}")
+            return
+            
+        self.pulse_active = True
+        self.pulse_start = time.monotonic()
+        self.pulse_color = POKE_COLOR
+        self.pulse_count = POKE_PULSE_COUNT
+        self.pulse_duration = POKE_PULSE_DURATION
+        self.pulse_gap = POKE_PULSE_GAP
+
+    def start_no_device_animation(self):
+        """Start a gentle red pulse animation for no devices"""
+        self.pulse_active = True
+        self.pulse_start = time.monotonic()
+        self.pulse_color = NO_DEVICE_COLOR
+        self.pulse_count = NO_DEVICE_PULSE_COUNT
+        self.pulse_duration = NO_DEVICE_PULSE_DURATION
+        self.pulse_gap = NO_DEVICE_PULSE_GAP
+
+    def start_device_pulse_animation(self, device_count):
+        """Start soft green pulses for each device found"""
+        if device_count <= 0:
+            return
+
+        self.device_pulse_active = True
+        self.device_pulse_start = time.monotonic()
+        self.device_pulse_count = min(device_count, 5)
+        print(f"Starting {self.device_pulse_count} soft green pulses for device count")
+
+    def check_distress_timeout(self, current_time):
+        """Check if distress has timed out without response"""
+        if (self.current_mode == FRIEND_DISTRESS and 
+            self.distress_start_time > 0):
+            
+            elapsed = current_time - self.distress_start_time
+            if elapsed >= DISTRESS_TIMEOUT:
+                print(f"Distress timed out after {DISTRESS_TIMEOUT} seconds")
+                if self.owner_distress_active:
+                    print("No one responded to our distress - entering NO_RESPONSE mode")
+                    self.set_mode(NO_RESPONSE, fade=True)
+                else:
+                    self.set_mode(DEFAULT, fade=True)
+                return True
+                
+        return False
+
+    def start_blip_sequence(self, color, count):
+        """Start a sequence of blips (for device counting)"""
+        self.blip_sequence = []
+        self.blip_sequence_index = 0
+        self.blip_active = False
+
+        for i in range(count):
+            self.blip_sequence.append((color, 0.6))
+            if i < count - 1:
+                self.blip_sequence.append(((0, 0, 0, 0), 0.4))
+
+    def quick_blip(self, color):
+        """Single quick blip (for device join/leave)"""
+        self.start_blip_sequence(color, 1)
+
+    def flash_green_once(self):
+        """Flash green once (for discovery request response)"""
+        print("Flashing green for discovery request response")
+        self.quick_blip(VIBRANT_GREEN)
+
+    def increment_no_response_counter(self):
+        """Increment the no-response mode counter"""
+        self.no_response_counter += 1
+        print(f"No-response mode: {self.no_response_counter}/3")
+        self.quick_blip(NO_RESPONSE_MODE_COLOR)
+
+    def reset_no_response_mode(self):
+        """Reset no-response mode to default"""
+        self.no_response_counter = 0
+        self.owner_distress_active = False
+        self.set_mode(DEFAULT, fade=True)
+
+    def set_owner_distress_active(self, active):
+        """Set whether this board initiated a distress signal"""
+        self.owner_distress_active = active
+        if active and self.current_mode == FRIEND_DISTRESS:
+            pass
+
+# ============================================================================
+# DEVICE TRACKER - Tracks active devices on the network (UPDATED)
+# ============================================================================
+class DeviceTracker:
+    def __init__(self):
+        self.active_heart_monitors = []   # List of active heart monitors
+        self.active_boards = []           # List of other boards
+        self.last_presence = 0            # Last time we sent presence
+        self.discovery_active = False     # Discovery in progress
+        self.discovery_start = 0          # When discovery started
+        self.discovery_responses = []     # Devices that responded
+        self.led = None                   # Reference to LED manager
+
+    def handle_heart_monitor(self, data, led):
+        """Handle heart monitor presence updates (online/offline)"""
+        device_id = data.get("device_id")
+        status = data.get("status")
+
+        if status == "online":
+            if device_id not in self.active_heart_monitors:
+                self.active_heart_monitors.append(device_id)
+                print(f"Heart monitor joined: {device_id}")
+                led.quick_blip(VIBRANT_GREEN)
+        elif status == "offline":
+            if device_id in self.active_heart_monitors:
+                self.active_heart_monitors.remove(device_id)
+                print(f"Heart monitor left: {device_id}")
+                led.quick_blip(WARM_YELLOW)
+
+    def handle_board_presence(self, board_id, status, mqtt_manager):
+        """Handle board presence updates for poke functionality"""
+        if status == "online":
+            if board_id not in self.active_boards:
+                self.active_boards.append(board_id)
+                print(f"Board joined: {board_id}")
+            mqtt_manager.add_available_board(board_id)
+        elif status == "offline":
+            if board_id in self.active_boards:
+                self.active_boards.remove(board_id)
+                print(f"Board left: {board_id}")
+            mqtt_manager.remove_available_board(board_id)
+
+    def handle_discovery_response(self, device_data):
+        """Handle discovery response messages"""
+        if not self.discovery_active:
+            return
+
+        device_id = device_data.get("device_id")
+        device_type = device_data.get("device_type")
+
+        if device_id not in self.discovery_responses and device_id != BOARD_ID:
+            self.discovery_responses.append(device_id)
+            print(f"Discovery: Found {device_type} - {device_id}")
+            
+            # IMMEDIATELY add to active lists based on device type
+            if device_type == "board":
+                if device_id not in self.active_boards:
+                    self.active_boards.append(device_id)
+                    print(f"Board added to active boards: {device_id}")
+            else:  # heart monitor
+                if device_id not in self.active_heart_monitors:
+                    self.active_heart_monitors.append(device_id)
+                    print(f"Heart monitor added to active monitors: {device_id}")
+
+    def handle_discovery_request(self, requester, led, mqtt_manager):
+        """Handle discovery request from another board"""
+        if requester != BOARD_ID:
+            print(f"Discovery request from {requester}, responding and flashing green")
+            if led.current_mode == DEFAULT:
+                led.flash_green_once()
+            # Send presence response
+            mqtt_manager.send_presence_response(requester)
+
+    def start_discovery(self, mqtt_manager):
+        """Start device discovery process to find all active devices"""
+        self.discovery_active = True
+        self.discovery_start = time.monotonic()
+        self.discovery_responses = []
+        
+        # Clear previous device lists
+        self.active_heart_monitors.clear()
+        self.active_boards.clear()
+        # Don't clear mqtt_manager.available_boards here - we'll repopulate it
+        
+        # Send discovery request
+        discovery_payload = {
+            "type": "discovery_request",
+            "from_board": BOARD_ID,
+            "timestamp": time.monotonic()
+        }
+        
+        print("Starting device discovery...")
+        mqtt_manager.send_discovery_request(discovery_payload)
+        return True
+
+    def update_discovery(self):
+        """Update discovery state and check if finished"""
+        if not self.discovery_active:
+            return True
+
+        elapsed = time.monotonic() - self.discovery_start
+        if elapsed >= DISCOVERY_TIMEOUT:
+            self.discovery_active = False
+            print(f"Discovery complete. Found {len(self.discovery_responses)} device(s)")
+            return True
+
+        return False
+
+    def should_send_presence(self, now):
+        """Check if it's time to send presence (I'm alive) message"""
+        return (now - self.last_presence) >= PRESENCE_INTERVAL
+
+# ============================================================================
+# MQTT MANAGER - Handles all MQTT communication (UPDATED)
+# ============================================================================
+class MQTTManager:
+    def __init__(self, led_manager, device_tracker):
+        self.led = led_manager
+        self.device_tracker = device_tracker
+        self.client = None
+        self.connected = False
+        self.last_reconnect_attempt = 0
+        self.reconnect_count = 0
+        
+        # State tracking
+        self.distress_sender = None      # Who sent distress we're watching
+        self.distress_counter = 0        # Button presses for responding
+        self.response_counter = 0        # Button presses for acknowledging help
+        self.available_boards = []       # Other boards available for poking
+        
+        # Track acknowledged distresses
+        self.acknowledged = []
+        
+        # Owner distress tracking
+        self.owner_distress_active = False
+        self.owner_distress_start = 0
+
+    def connect(self):
+        """Connect to WiFi and MQTT broker with visual feedback"""
+        try:
+            print("Connecting to WiFi...")
+            self.led.update_startup_phase(1)  # WiFi connecting - shows deep blue
+            time.sleep(0.5)  # Give time for the phase change to register
+            
+            # Connect to WiFi
+            wifi.radio.connect(SSID, PASSWORD)
+            print(f"WiFi OK: {wifi.radio.ipv4_address}")
+            self.led.update_startup_phase(2)  # WiFi connected - shows bright blue
+            time.sleep(0.5)  # Let the blue show
+
+            # Create MQTT client
+            pool = socketpool.SocketPool(wifi.radio)
+            self.client = MQTT.MQTT(
+                broker=MQTT_BROKER,
+                port=MQTT_PORT,
+                socket_pool=pool,
+                keep_alive=30,
+                socket_timeout=0.1,
+            )
+
+            # Set up message handlers
+            self.client.on_message = self._handle_message
+            self.client.on_disconnect = self._handle_disconnect
+            
+            print("Connecting to MQTT broker...")
+            self.led.update_startup_phase(3)  # Server connecting - shows soft green
+            time.sleep(0.5)  # Show the green
+            
+            # Connect to broker
+            self.client.connect()
+            self.connected = True
+            self.reconnect_count = 0
+            
+            # Subscribe to all topics
+            self.client.subscribe(MQTT_TOPIC_DISTRESS)
+            self.client.subscribe(MQTT_TOPIC_ACKNOWLEDGE)
+            self.client.subscribe(MQTT_TOPIC_PRESENCE)
+            self.client.subscribe(MQTT_TOPIC_POKE)
+            self.client.subscribe(MQTT_TOPIC_DISCOVERY)
+
+            print("MQTT connected!")
+            self.led.update_startup_phase(4)  # Server connected - shows bright green
+            time.sleep(0.5)  # Show the bright green
+            
+            return True
+
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            self.connected = False
+            return False
+    
+    def _handle_disconnect(self, client, user_data, rc):
+        """Handle MQTT disconnection"""
+        print(f"MQTT disconnected (rc={rc})")
+        self.connected = False
+        self.led.quick_blip(NO_DEVICE_COLOR)
+
+    def _try_reconnect(self):
+        """Attempt to reconnect to MQTT"""
+        now = time.monotonic()
+        
+        if now - self.last_reconnect_attempt < RECONNECT_INTERVAL:
+            return False
+            
+        self.last_reconnect_attempt = now
+        self.reconnect_count += 1
+        
+        print(f"Attempting reconnect #{self.reconnect_count}...")
+        
+        try:
+            if self.client:
+                try:
+                    self.client.disconnect()
+                except:
+                    pass
+            
+            try:
+                wifi.radio.connect(SSID, PASSWORD)
+            except:
+                pass
+                
+            if self.connect():
+                print("Reconnect successful!")
+                return True
+            else:
+                print("Reconnect failed")
+                return False
+                
+        except Exception as e:
+            print(f"Reconnect error: {e}")
+            return False
+    
+    def _handle_message(self, client, topic, message):
+        """Handle incoming MQTT messages"""
+        try:
+            data = json.loads(message)
+
+            if topic == MQTT_TOPIC_DISTRESS and data.get("alert") == "heart_rate_jump":
+                # Someone's heart monitor detected distress
+                sender = data.get("device_id")
+                
+                if sender:
+                    if sender == OWNER_DEVICE_ID:
+                        # OUR heart monitor is in distress
+                        print("Our heart monitor is in distress (waiting for response)...")
+                        self.owner_distress_active = True
+                        self.owner_distress_start = time.monotonic()
+                        self.led.set_owner_distress_active(True)
+                        self.led.current_mode = FRIEND_DISTRESS
+                        self.led.distress_start_time = time.monotonic()
+                        
+                    elif sender != OWNER_DEVICE_ID:
+                        # Someone else's distress - show urgent indication
+                        if sender in self.acknowledged:
+                            return
+
+                        print(f"Distress from: {sender}")
+                        self.distress_sender = sender
+                        self.distress_counter = 0
+                        self.led.set_mode(FRIEND_DISTRESS)
+
+            elif topic == MQTT_TOPIC_ACKNOWLEDGE and data.get("alert") == "distress_acknowledged":
+                # Someone acknowledged a distress signal
+                target = data.get("to_device")
+                sender = data.get("from_board")
+
+                print(f"Ack: {sender} -> {target}")
+
+                if target not in self.acknowledged:
+                    self.acknowledged.append(target)
+                    if len(self.acknowledged) > 10:
+                        self.acknowledged.pop(0)
+
+                # Check if this acknowledgment is for someone else's distress we were watching
+                if (target != OWNER_DEVICE_ID and
+                    self.distress_sender == target and
+                    sender != BOARD_ID):
+                    print(f"Someone else helped {target}")
+                    self.distress_sender = None
+                    self.distress_counter = 0
+                    self.led.set_mode(DEFAULT)
+
+                # Check if this acknowledgment is for OUR distress
+                elif target == OWNER_DEVICE_ID:
+                    print("Our distress was acknowledged!")
+                    self.response_counter = 0
+                    self.owner_distress_active = False
+                    self.led.set_owner_distress_active(False)
+                    self.led.set_mode(FRIEND_RESPONSE)
+                    
+                # Check if WE sent this acknowledgment
+                elif sender == BOARD_ID:
+                    print(f"We acknowledged {target}'s distress - returning to normal")
+                    if self.distress_sender == target:
+                        self.distress_sender = None
+                        self.distress_counter = 0
+                    self.led.set_mode(DEFAULT)
+                    
+            elif topic == MQTT_TOPIC_POKE:
+                self._handle_poke_message(data)
+
+            elif topic == MQTT_TOPIC_PRESENCE:
+                self._handle_presence_message(data)
+                
+            elif topic == MQTT_TOPIC_DISCOVERY:
+                self._handle_discovery_message(data)
+
+        except Exception as e:
+            print(f"MQTT message error: {e}")
+    
+    def _handle_poke_message(self, data):
+        """Handle poke messages from other boards"""
+        target_board = data.get("target_board")
+        sender = data.get("from_board")
+        
+        if target_board == BOARD_ID:
+            print(f"Received poke from {sender}!")
+            
+            current_mode = self.led.current_mode
+            if current_mode in (FRIEND_DISTRESS, FRIEND_RESPONSE, NO_RESPONSE):
+                print(f"Ignoring poke while in mode {current_mode}")
+                self.led.quick_blip(POKE_COLOR)
+                return
+                
+            if not self.led.pulse_active or self.led.pulse_color != POKE_COLOR:
+                self.led.start_poke_animation()
+
+    def _handle_presence_message(self, data):
+        """Handle presence messages from both heart monitors and boards"""
+        device_id = data.get("device_id")
+        device_type = data.get("type")
+        status = data.get("status")
+
+        if not device_id or device_id == BOARD_ID:
+            return
+
+        # Handle BOARD presence
+        if device_type == "board":
+            if status == "online":
+                # Add to device tracker's board list
+                if device_id not in self.device_tracker.active_boards:
+                    self.device_tracker.active_boards.append(device_id)
+                    print(f"Presence: Board joined -> {device_id}")
+                    if self.led.current_mode == DEFAULT:
+                        self.led.quick_blip(VIBRANT_GREEN)
+
+                # CRITICAL FIX: Always add to available boards when online
+                if device_id not in self.available_boards:
+                    self.available_boards.append(device_id)
+                    print(f"Board added to available boards: {device_id}")
+
+            elif status == "offline":
+                if device_id in self.device_tracker.active_boards:
+                    self.device_tracker.active_boards.remove(device_id)
+                    print(f"Presence: Board left -> {device_id}")
+                    if self.led.current_mode == DEFAULT:
+                        self.led.quick_blip(WARM_YELLOW)
+
+                if device_id in self.available_boards:
+                    self.available_boards.remove(device_id)
+                    print(f"Board removed from available boards: {device_id}")
+
+        # Handle HEART MONITOR presence
+        else:
+            self.device_tracker.handle_heart_monitor(data, self.led)
+
+    def _handle_discovery_message(self, data):
+        """Handle discovery messages"""
+        message_type = data.get("type")
+        
+        if message_type == "discovery_request":
+            requester = data.get("from_board")
+            if requester != BOARD_ID:
+                self.device_tracker.handle_discovery_request(requester, self.led, self)
+                
+        elif message_type == "presence_response":
+            self.device_tracker.handle_discovery_response(data)
+
+    def check_distress_timeouts(self, current_time):
+        """Check all distress timeouts"""
+        # Check if someone else's distress we're watching has timed out
+        if self.distress_sender and self.led.current_mode == FRIEND_DISTRESS:
+            if self.led.check_distress_timeout(current_time):
+                self.distress_sender = None
+                self.distress_counter = 0
+                
+        # Check if our own distress has timed out
+        if self.owner_distress_active and self.owner_distress_start > 0:
+            elapsed = current_time - self.owner_distress_start
+            if elapsed >= DISTRESS_TIMEOUT:
+                print(f"Our distress timed out after {DISTRESS_TIMEOUT} seconds - no one responded")
+                self.led.set_mode(NO_RESPONSE, fade=True)
+                self.owner_distress_active = False
+                return True
+
+    def send_discovery_request(self, payload):
+        """Send a discovery request to find all active devices"""
+        if not self.connected:
+            return False
+            
+        try:
+            self.client.publish(MQTT_TOPIC_DISCOVERY, json.dumps(payload))
+            print("Discovery request sent")
+            return True
+        except Exception as e:
+            print(f"Failed to send discovery request: {e}")
+            return False
+
+    def send_presence_response(self, requester):
+        """Send presence response to a discovery request"""
+        if not self.connected:
+            return
+            
+        payload = {
+            "type": "presence_response",
+            "device_id": BOARD_ID,
+            "device_type": "board",
+            "status": "online",
+            "owner_device": OWNER_DEVICE_ID,
+            "timestamp": time.monotonic(),
+            "in_response_to": requester
+        }
+        
+        try:
+            self.client.publish(MQTT_TOPIC_DISCOVERY, json.dumps(payload))
+        except Exception as e:
+            print(f"Failed to send presence response: {e}")
+
+    def send_presence(self):
+        """Send presence update to let others know we're online"""
+        if not self.connected:
+            return
+
+        payload = {
+            "device_id": BOARD_ID,
+            "type": "board",
+            "status": "online",
+            "owner_device": OWNER_DEVICE_ID,
+            "timestamp": time.monotonic()
+        }
+
+        try:
+            self.client.publish(MQTT_TOPIC_PRESENCE, json.dumps(payload))
+        except Exception as e:
+            print(f"Failed to send presence: {e}")
+            self.connected = False
+
+    def send_acknowledgment(self, distress_sender):
+        """Send acknowledgment that we're responding to distress"""
+        if not self.connected:
+            return False
+
+        payload = {
+            "alert": "distress_acknowledged",
+            "timestamp": time.monotonic(),
+            "from_board": BOARD_ID,
+            "to_device": distress_sender,
+            "message": "Help is on the way!"
+        }
+
+        try:
+            self.client.publish(MQTT_TOPIC_ACKNOWLEDGE, json.dumps(payload))
+            print(f"Ack sent to {distress_sender}")
+            
+            if distress_sender not in self.acknowledged:
+                self.acknowledged.append(distress_sender)
+            return True
+            
+        except Exception as e:
+            print(f"Failed to send ack: {e}")
+            self.connected = False
+            return False
+    
+    def send_poke(self, target_board):
+        """Send a poke to another board"""
+        if not self.connected:
+            print("Cannot send poke: Not connected")
+            return False
+            
+        payload = {
+            "from_board": BOARD_ID,
+            "target_board": target_board,
+            "timestamp": time.monotonic()
+        }
+        
+        try:
+            self.client.publish(MQTT_TOPIC_POKE, json.dumps(payload))
+            print(f"Poked {target_board}")
+            return True
+        except Exception as e:
+            print(f"Failed to send poke: {e}")
+            self.connected = False
+            return False
+
+    def add_available_board(self, board_id):
+        """Add a board to the list of available boards for poking"""
+        if board_id != BOARD_ID and board_id not in self.available_boards:
+            self.available_boards.append(board_id)
+            print(f"Available board added: {board_id}")
+            if len(self.available_boards) > 20:
+                self.available_boards.pop(0)
+
+    def remove_available_board(self, board_id):
+        """Remove a board from available list"""
+        if board_id in self.available_boards:
+            self.available_boards.remove(board_id)
+            print(f"Available board removed: {board_id}")
+
+    def get_random_board(self):
+        """Get a random board from available boards for poking"""
+        if not self.available_boards:
+            return None
+        return random.choice(self.available_boards)
+
+    def process(self):
+        """Process MQTT messages and handle reconnection"""
+        if self.connected:
+            try:
+                self.client.loop(0.1)
+            except Exception as e:
+                print(f"MQTT loop error: {e}")
+                self.connected = False
+        else:
+            if time.monotonic() - self.last_reconnect_attempt >= RECONNECT_INTERVAL:
+                self._try_reconnect()
+
+# ============================================================================
+# MAIN APPLICATION - Coordinates all components (UPDATED)
+# ============================================================================
+class HeartrateBoard:
+    def __init__(self):
+        # Initialize all system components
+        self.led = LEDManager()
+        self.buttons = ButtonManager()
+        self.device_tracker = DeviceTracker()
+        self.mqtt = MQTTManager(self.led, self.device_tracker)
+        
+        self.device_tracker.led = self.led
+
+        # Timing variables
+        self.last_mqtt_check = 0
+        self.last_frame = time.monotonic()
+        self.last_poke_sent = 0
+        self.last_connection_check = 0
+        self.last_timeout_check = 0
+
+    def startup(self):
+        """Run startup sequence with visual feedback"""
+        print(f"\nBoard: {BOARD_ID}, Owner: {OWNER_DEVICE_ID}")
+        
+        print("Starting up...")
+        self.led.start_startup_sequence()  # Begin at phase 0 (white)
+        time.sleep(2.0)  # Let white show for 2 seconds
+        
+        print("Connecting to network...")
+        if not self.mqtt.connect():  # This will trigger phases 1-4 with built-in delays
+            print("Connection failed - staying in startup")
+            return False
+        
+        # Add extra delay to let phase 4 (bright green) show
+        time.sleep(1.0)
+        
+        print("Setting up base state...")
+        self.led.update_startup_phase(5)  # Move to warm base blue
+        time.sleep(2.5)  # Allow phase 5 to complete (fade + hold)
+        
+        self.mqtt.send_presence()
+        self.device_tracker.last_presence = time.monotonic()
+
+        print("Starting device discovery...")
+        self.led.start_blip_sequence(WARM_BLUE, 2)
+        self.device_tracker.start_discovery(self.mqtt)
+        
+        print(f"Waiting {DISCOVERY_TIMEOUT} seconds for device responses...")
+        start_time = time.monotonic()
+        
+        while time.monotonic() - start_time < DISCOVERY_TIMEOUT:
+            self.mqtt.process()
+            self.led.update(0.05)
+            if self.device_tracker.update_discovery():
+                break
+            time.sleep(0.05)
+
+        self.device_tracker.discovery_active = False
+
+        # Count devices from discovery responses (already added to active lists)
+        heart_monitor_count = len(self.device_tracker.active_heart_monitors)
+        board_count = len(self.device_tracker.active_boards)
+        total_devices = heart_monitor_count + board_count
+        
+        print(f"\nDiscovery Results:")
+        print(f"- Found {heart_monitor_count} heart monitor(s)")
+        print(f"- Found {board_count} other board(s)")
+        print(f"- Total devices: {total_devices}")
+        
+        # IMPORTANT: After discovery, add all active boards to available_boards
+        for board_id in self.device_tracker.active_boards:
+            if board_id not in self.mqtt.available_boards:
+                self.mqtt.available_boards.append(board_id)
+                print(f"Added {board_id} to available boards after discovery")
+        
+        # Show visual feedback based on devices found
+        if total_devices == 0:
+            print("No other devices found - showing red pulse")
+            self.led.quick_blip(NO_DEVICE_COLOR)
+            time.sleep(1.0)  # Let red show
+        else:
+            print(f"Showing {min(total_devices, 5)} soft green pulses for {total_devices} device(s) found")
+            self.led.start_device_pulse_animation(total_devices)
+            
+            # Wait for pulses to complete
+            pulse_duration = min(total_devices, 5) * (DEVICE_PULSE_DURATION + DEVICE_PULSE_GAP)
+            time.sleep(pulse_duration + 0.5)
+
+        print("Transitioning to operational mode...")
+        self.led.update_startup_phase(6)  # Final transition to DEFAULT
+        
+        # Allow time for final transition to complete
+        time.sleep(2.5)
+
+        print("\n" + "="*50)
+        print("DEVICE READY!")
+        print("="*50)
+        print(f"Press button in default mode to poke a random board")
+        print(f"Distress timeout: {DISTRESS_TIMEOUT} seconds")
+        print(f"Available boards: {self.mqtt.available_boards}")
+        print("="*50 + "\n")
+        
+        return True
+
+    def run(self):
+        """Main application loop"""
+        if not self.startup():
+            # Stay in startup mode with connection retry
+            while True:
+                # Gentle pulsing while trying to connect
+                pulse = 0.3 + 0.2 * math.sin(time.monotonic() * 2)
+                color = tuple(int(c * pulse) for c in SOFT_WHITE)
+                self.led.pixels.fill(color)
+                self.led.pixels.show()
+                
+                self.mqtt.process()
+                time.sleep(0.1)
+
+        while True:
+            current_time = time.monotonic()
+            dt = current_time - self.last_frame
+            self.last_frame = current_time
+
+            self.led.update(dt)
+
+            if self.buttons.check_press():
+                pass
+            
+            if self.buttons.get_press_detected():
+                self._handle_button()
+
+            if current_time - self.last_mqtt_check >= MQTT_CHECK_INTERVAL:
+                self.mqtt.process()
+                self.last_mqtt_check = current_time
+            
+            if current_time - self.last_timeout_check >= 1.0:
+                self.mqtt.check_distress_timeouts(current_time)
+                self.last_timeout_check = current_time
+
+            if (self.device_tracker.should_send_presence(current_time) and 
+                self.mqtt.connected):
+                self.mqtt.send_presence()
+                self.device_tracker.last_presence = current_time
+
+            if current_time - self.last_connection_check >= 5.0:
+                self.last_connection_check = current_time
+                if not self.mqtt.connected:
+                    self.led.pixels[0] = (30, 0, 0, 0)
+                    self.led.pixels.show()
+                    time.sleep(0.1)
+                    self.led.pixels[0] = self.led.mode_colors[DEFAULT]
+                    self.led.pixels.show()
+
+            time.sleep(MAIN_LOOP_DELAY)
+
+    def _handle_button(self):
+        """Handle button presses based on current mode"""
+        current_time = time.monotonic()
+        
+        current_mode = self.led.current_mode
+        
+        if current_mode == FRIEND_DISTRESS:
+            if self.mqtt.distress_sender:
+                self.mqtt.distress_counter += 1
+                print(f"Distress: {self.mqtt.distress_counter}/3")
+                self.led.quick_blip(VIBRANT_GREEN)
+                if self.mqtt.distress_counter >= 3:
+                    if self.mqtt.send_acknowledgment(self.mqtt.distress_sender):
+                        self.mqtt.distress_sender = None
+                        self.mqtt.distress_counter = 0
+                        self.led.set_mode(DEFAULT)
+                        print("Acknowledgment sent - returning to normal")
+                    else:
+                        print("Failed to send acknowledgment")
+            else:
+                print("Our own distress active - waiting for response")
+                    
+        elif current_mode == FRIEND_RESPONSE:
+            self.mqtt.response_counter += 1
+            print(f"Response: {self.mqtt.response_counter}/3")
+            self.led.quick_blip(FRIEND_RESPONSE_COLOR)
+            if self.mqtt.response_counter >= 3:
+                self.mqtt.response_counter = 0
+                self.led.set_mode(DEFAULT)
+                print("Response acknowledged - returning to normal")
+                
+        elif current_mode == NO_RESPONSE:
+            self.led.increment_no_response_counter()
+            
+            if self.led.no_response_counter >= 3:
+                print("No-response mode completed, returning to default")
+                self.led.reset_no_response_mode()
+                
+        elif current_mode == DEFAULT:
+            if current_time - self.last_poke_sent < POKE_COOLDOWN:
+                print(f"Poke cooldown: {POKE_COOLDOWN - (current_time - self.last_poke_sent):.1f}s remaining")
+                return
+                
+            if (not self.led.pulse_active and
+                not self.led.no_response_alert_active and
+                not self.led.device_pulse_active):
+                
+                if not self.mqtt.connected:
+                    print("Cannot poke: Not connected to MQTT")
+                    self.led.start_no_device_animation()
+                    return
+                
+                target = self.mqtt.get_random_board()
+                
+                if target:
+                    if self.mqtt.send_poke(target):
+                        self.led.quick_blip(POKE_COLOR)
+                        self.last_poke_sent = current_time
+                        print(f"Poked random board: {target}")
+                        print(f"Available boards: {self.mqtt.available_boards}")
+                    else:
+                        print("Failed to send poke (connection lost)")
+                else:
+                    print("No other boards available to poke")
+                    print(f"Available boards list: {self.mqtt.available_boards}")
+                    self.led.start_no_device_animation()
+        else:
+            print(f"Ignoring button press while in mode {current_mode}")
+
+# ============================================================================
+# START THE APPLICATION
+# ============================================================================
+if __name__ == "__main__":
+    app = HeartrateBoard()
+    app.run()
