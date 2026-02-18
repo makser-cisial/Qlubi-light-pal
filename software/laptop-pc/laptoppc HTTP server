@@ -1,0 +1,972 @@
+
+from flask import Flask, request, jsonify
+import time
+import json
+import threading
+import paho.mqtt.client as mqtt
+import atexit
+import signal
+import sys
+from collections import deque
+import statistics
+
+app = Flask(__name__)
+
+# ============================================================================
+# CONFIGURATION SETTINGS (USER CAN CHANGE THESE)
+# ============================================================================
+
+# --- MQTT Settings ---
+MQTT_BROKER = "exampleserver"  # Change to your MQTT broker
+MQTT_PORT = xxxx  # Change if using different port
+MQTT_TOPIC_DISTRESS = "heartrate1/distressAlert"
+MQTT_TOPIC_PRESENCE = "heartrate1/presence"
+MQTT_TOPIC_ACKNOWLEDGE = "heartrate1/acknowledgeAlert"
+
+# --- Qlubi Device Identity ---
+QLUBI_ID = "examplemonitor1"  # Change to your device name
+QLUBI_TYPE = "heart_monitor"  # Change device type if needed
+
+# --- Server Settings ---
+SERVER_HOST = '0.0.0.0'  # Bind to all interfaces
+SERVER_PORT = 8000  # Change port if needed
+
+# --- Display Settings ---
+DISPLAY_INTERVAL = 30  # Show status every 30 seconds
+verbose_logging = False  # Set to True for debugging, False for clean output
+
+# --- Calibration Settings ---
+CALIBRATION_MINUTES = 5  # Take full 5 minutes for initial calibration
+CALIBRATION_SAMPLES = 30  # ~5 minutes at 6-second intervals (30 samples)
+
+# --- Dynamic Baseline Settings (Option 3: More Dynamic) ---
+QUIET_THRESHOLD = 8  # HR within ±8 BPM of baseline = quiet (increased from 5)
+BASELINE_UPDATE_INTERVAL = 180  # Update baseline every 3 minutes (reduced from 5)
+MIN_QUIET_SAMPLES = 5  # Need only 5 quiet samples (reduced from 10)
+DYNAMIC_BASELINE_WEIGHT = 0.15  # 15% weight to new values (increased from 10%)
+QUIET_CHECK_INTERVAL = 60  # Check for quiet periods every 60 seconds
+MAX_BASELINE_CHANGE = 12  # Max 12 BPM change at once (increased from 8)
+
+# --- Stress Detection Settings ---
+ABSOLUTE_THRESHOLD = 10  # +10 BPM above baseline triggers stress
+RELATIVE_THRESHOLD = 0.20  # +20% above baseline triggers stress
+MIN_DURATION_SECONDS = 30  # 30 seconds sustained elevation for alert
+
+# --- Cooldown Settings ---
+ALERT_COOLDOWN_TIME = 5 * 60  # 5 minutes between alerts (300 seconds)
+
+# --- Legacy Fallback Settings ---
+COMPARE_DELTA = 3  # Legacy threshold (NOT USED during calibration anymore)
+
+# ============================================================================
+# SYSTEM VARIABLES (DON'T CHANGE THESE)
+# ============================================================================
+
+# --- Heart Rate Monitoring ---
+last_bpm = 72
+count_bpm = 0
+sum_bpm = 0
+avg_bpm = 72
+
+# --- Advanced Stress Detection Variables ---
+baseline_established = False
+baseline_hr = 72
+baseline_samples = deque(maxlen=CALIBRATION_SAMPLES)
+is_calibrating = True
+calibration_start_time = 0  # Changed: Start at 0, will be set on first reading
+
+# Dynamic baseline tracking
+dynamic_baseline = 72
+baseline_history = deque(maxlen=60)  # Keep last hour of quiet HR values
+last_baseline_update = 0
+
+# Stress state tracking
+stress_start_time = 0
+is_stressed = False
+stress_samples = deque(maxlen=10)  # Store recent HR readings (~60 seconds)
+
+# Quiet period detection
+quiet_period_samples = deque(maxlen=20)  # Track recent HR for quiet detection
+last_quiet_check = 0
+
+# --- Cooldown Tracking ---
+cooldown_active = False
+cooldown_type = None  # "alert" or "calibration"
+cooldown_start = 0
+cooldown_end = 0
+
+# --- MQTT Client ---
+mqtt_client = None
+
+# --- Display tracking ---
+last_display_time = 0
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def clean_print(message, level="INFO"):
+    """Print messages with clean formatting"""
+    timestamp = time.strftime('%H:%M:%S')
+
+    if level == "INFO":
+        print(f"[{timestamp}] {message}")
+    elif level == "SUCCESS":
+        print(f"[{timestamp}] ✅ {message}")
+    elif level == "WARNING":
+        print(f"[{timestamp}] ⚠️  {message}")
+    elif level == "ERROR":
+        print(f"[{timestamp}] ❌ {message}")
+    elif level == "ALERT":
+        print(f"[{timestamp}] 🚨 {message}")
+    elif level == "CALIBRATION":
+        print(f"[{timestamp}] 📊 {message}")
+    elif level == "DATA":
+        print(f"[{timestamp}] 📡 {message}")
+    elif level == "COOLDOWN":
+        print(f"[{timestamp}] ⏰ {message}")
+
+
+def display_status_summary():
+    """Show a clean status summary periodically"""
+    global last_display_time
+
+    current_time = time.time()
+    if current_time - last_display_time >= DISPLAY_INTERVAL:
+        last_display_time = current_time
+
+        if is_calibrating:
+            if calibration_start_time == 0:
+                # Waiting for first reading
+                clean_print(f"CALIBRATION: Waiting for first heart rate reading...", "CALIBRATION")
+                clean_print(f"Current HR: {last_bpm} BPM", "INFO")
+            else:
+                elapsed_minutes = (current_time - calibration_start_time) / 60
+                samples_collected = len(baseline_samples)
+                progress_percentage = min(100, (elapsed_minutes / CALIBRATION_MINUTES) * 100)
+
+                time_remaining = max(0, CALIBRATION_MINUTES * 60 - (current_time - calibration_start_time))
+
+                clean_print(
+                    f"CALIBRATION: {samples_collected}/{CALIBRATION_SAMPLES} samples | "
+                    f"Time: {elapsed_minutes:.1f}/{CALIBRATION_MINUTES} min ({progress_percentage:.1f}%)",
+                    "CALIBRATION")
+                clean_print(f"Current HR: {last_bpm} BPM | Avg: {avg_bpm:.1f} BPM | "
+                            f"Time remaining: {int(time_remaining / 60)}:{int(time_remaining % 60):02d}", "INFO")
+        else:
+            effective_baseline = get_effective_baseline()
+            clean_print(f"MONITORING ACTIVE", "SUCCESS")
+            clean_print(f"Baseline: {effective_baseline:.1f} BPM | Current: {last_bpm} BPM | Samples: {count_bpm}",
+                        "INFO")
+
+            if is_stressed:
+                stress_duration = current_time - stress_start_time
+                clean_print(f"STRESS DETECTED: {stress_duration:.0f}/{MIN_DURATION_SECONDS}s", "WARNING")
+
+        # Always show cooldown status if active
+        if cooldown_active:
+            display_cooldown_status()
+
+
+def display_cooldown_status():
+    """Display detailed cooldown status"""
+    global cooldown_type, cooldown_start, cooldown_end
+
+    current_time = time.time()
+    if cooldown_active and cooldown_end > current_time:
+        remaining = cooldown_end - current_time
+        minutes = int(remaining // 60)
+        seconds = int(remaining % 60)
+
+        if cooldown_type == "alert":
+            clean_print(f"ALERT COOLDOWN: {minutes}:{seconds:02d} remaining until next alert", "COOLDOWN")
+        elif cooldown_type == "calibration":
+            clean_print(f"CALIBRATION COOLDOWN: {minutes}:{seconds:02d} remaining", "COOLDOWN")
+        else:
+            clean_print(f"COOLDOWN ACTIVE: {minutes}:{seconds:02d} remaining", "COOLDOWN")
+    elif cooldown_active:
+        # Cooldown expired but not cleared yet
+        clean_print(f"COOLDOWN EXPIRED - monitoring active", "SUCCESS")
+        reset_cooldown()
+
+
+def set_cooldown(cooldown_type_name, duration_seconds):
+    """Set a cooldown period with specific type and duration"""
+    global cooldown_active, cooldown_type, cooldown_start, cooldown_end
+
+    cooldown_active = True
+    cooldown_type = cooldown_type_name
+    cooldown_start = time.time()
+    cooldown_end = cooldown_start + duration_seconds
+
+    clean_print(
+        f"{cooldown_type.upper()} COOLDOWN ACTIVATED for {duration_seconds // 60}:{duration_seconds % 60:02d} minutes",
+        "COOLDOWN")
+
+    # Auto-reset cooldown after duration
+    def auto_reset_cooldown():
+        global cooldown_active
+        time.sleep(duration_seconds)
+        cooldown_active = False
+        clean_print(f"{cooldown_type.upper()} COOLDOWN COMPLETE - monitoring active", "SUCCESS")
+
+    threading.Thread(target=auto_reset_cooldown, daemon=True).start()
+
+
+def reset_cooldown():
+    """Reset cooldown state"""
+    global cooldown_active, cooldown_type, cooldown_start, cooldown_end
+
+    cooldown_active = False
+    cooldown_type = None
+    cooldown_start = 0
+    cooldown_end = 0
+
+
+def setup_mqtt():
+    global mqtt_client
+    try:
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+
+        # Last will - notify if server disconnects
+        will_payload = {
+            "device_id": QLUBI_ID,
+            "status": "offline",
+            "timestamp": time.time(),
+            "type": QLUBI_TYPE
+        }
+        mqtt_client.will_set(MQTT_TOPIC_PRESENCE, json.dumps(will_payload), qos=1)
+
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+
+        # Listen for acknowledgments
+        def on_message(client, userdata, msg):
+            if msg.topic == MQTT_TOPIC_ACKNOWLEDGE:
+                try:
+                    data = json.loads(msg.payload)
+                    if data.get("to_device") == QLUBI_ID:
+                        clean_print(f"Distress acknowledged by user", "SUCCESS")
+                except:
+                    pass
+
+        mqtt_client.on_message = on_message
+        mqtt_client.subscribe(MQTT_TOPIC_ACKNOWLEDGE)
+
+        if verbose_logging:
+            clean_print(f"MQTT setup successful", "SUCCESS")
+        return True
+    except Exception as e:
+        clean_print(f"MQTT setup error: {e}", "ERROR")
+        return False
+
+
+def send_qlubi_online():
+    if mqtt_client is None:
+        if not setup_mqtt():
+            return
+
+    try:
+        payload = {
+            "device_id": QLUBI_ID,
+            "status": "online",
+            "timestamp": time.time(),
+            "type": QLUBI_TYPE
+        }
+        mqtt_client.publish(MQTT_TOPIC_PRESENCE, json.dumps(payload), qos=1)
+        clean_print(f"Connected to MQTT broker", "SUCCESS")
+    except Exception as e:
+        clean_print(f"Send online error: {e}", "ERROR")
+
+
+def send_qlubi_offline():
+    if mqtt_client:
+        try:
+            payload = {
+                "device_id": QLUBI_ID,
+                "status": "offline",
+                "timestamp": time.time(),
+                "type": QLUBI_TYPE
+            }
+            mqtt_client.publish(MQTT_TOPIC_PRESENCE, json.dumps(payload), qos=1)
+            clean_print(f"Sent offline notification", "INFO")
+        except Exception as e:
+            clean_print(f"Send offline error: {e}", "ERROR")
+
+
+def check_quiet_period(current_hr):
+    """Check if current HR is in a quiet period (for dynamic baseline updates)"""
+    global baseline_hr, dynamic_baseline, quiet_period_samples, last_quiet_check
+
+    if not baseline_established:
+        return False
+
+    current_time = time.time()
+
+    # Add current HR to quiet period tracking
+    quiet_period_samples.append(current_hr)
+
+    # Check for quiet periods periodically
+    if current_time - last_quiet_check >= QUIET_CHECK_INTERVAL:
+        last_quiet_check = current_time
+
+        if len(quiet_period_samples) >= 5:  # Need at least 5 samples
+            # Calculate variability in recent samples
+            hr_variability = max(quiet_period_samples) - min(quiet_period_samples)
+
+            # Check if HR is stable and close to baseline
+            if (hr_variability <= 3 and  # Very stable HR
+                    abs(current_hr - dynamic_baseline) <= QUIET_THRESHOLD):
+
+                # This is a quiet period - add to baseline history
+                baseline_history.append(current_hr)
+
+                if verbose_logging:
+                    clean_print(f"Quiet period detected: HR={current_hr}, Baseline={dynamic_baseline:.1f}", "INFO")
+                    clean_print(f"Quiet samples collected: {len(baseline_history)}/{MIN_QUIET_SAMPLES}", "INFO")
+
+                # Update dynamic baseline if we have enough quiet samples
+                if (current_time - last_baseline_update >= BASELINE_UPDATE_INTERVAL and
+                        len(baseline_history) >= MIN_QUIET_SAMPLES):
+                    update_dynamic_baseline()
+
+        # Clear samples for next check period
+        quiet_period_samples.clear()
+
+    return True
+
+
+def update_dynamic_baseline():
+    """Update the dynamic baseline based on recent quiet periods"""
+    global dynamic_baseline, last_baseline_update, baseline_history
+
+    if len(baseline_history) < MIN_QUIET_SAMPLES:
+        return
+
+    # Calculate median of quiet periods (more robust than mean)
+    new_quiet_median = statistics.median(baseline_history)
+
+    # Only update if change is reasonable (not a sudden jump)
+    baseline_change = abs(new_quiet_median - dynamic_baseline)
+
+    if baseline_change <= MAX_BASELINE_CHANGE:
+        # Weighted average with new weight
+        dynamic_baseline = (dynamic_baseline * (1 - DYNAMIC_BASELINE_WEIGHT)) + (
+                new_quiet_median * DYNAMIC_BASELINE_WEIGHT)
+        last_baseline_update = time.time()
+
+        clean_print(f"Dynamic baseline updated: {dynamic_baseline:.1f} BPM", "INFO")
+        clean_print(f"  Based on {len(baseline_history)} quiet samples | Quiet median: {new_quiet_median:.1f} BPM",
+                    "INFO")
+        clean_print(f"  Change: {baseline_change:.1f} BPM | Weight: {DYNAMIC_BASELINE_WEIGHT * 100:.0f}%", "INFO")
+
+        # Clear history for next update cycle
+        baseline_history.clear()
+    else:
+        if verbose_logging:
+            clean_print(f"Baseline change too large ({baseline_change:.1f} BPM > {MAX_BASELINE_CHANGE} BPM), ignoring",
+                        "INFO")
+
+
+def get_effective_baseline():
+    """Get the baseline to use for stress detection"""
+    global baseline_hr, dynamic_baseline, baseline_established
+
+    if not baseline_established:
+        return avg_bpm
+
+    # Use dynamic baseline if available, otherwise static baseline
+    return dynamic_baseline
+
+
+def send_distress():
+    """Send distress signal - simplified format to match requirements
+       Sends only: {"alert": "heart_rate_jump", "device_id": "heart_monitor_server_2"}
+    """
+    global cooldown_active, cooldown_type
+
+    if verbose_logging:
+        clean_print(f"DEBUG: send_distress() called", "INFO")
+
+    if cooldown_active:
+        display_cooldown_status()
+        return False
+
+    if mqtt_client is None:
+        if not setup_mqtt():
+            clean_print(f"MQTT client not available", "ERROR")
+            return False
+
+    try:
+        # Simplified payload - exactly as specified in requirements
+        # Only sends alert type and device ID, no extra data
+        payload = {
+            "alert": "heart_rate_jump",
+            "device_id": QLUBI_ID
+        }
+
+        if verbose_logging:
+            clean_print(f"DEBUG: Publishing to {MQTT_TOPIC_DISTRESS}", "INFO")
+
+        result = mqtt_client.publish(MQTT_TOPIC_DISTRESS, json.dumps(payload), qos=1)
+
+        # Wait for publish to complete
+        result.wait_for_publish()
+
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            clean_print("🚨 DISTRESS SIGNAL SENT!", "ALERT")
+            clean_print(f"  Device: {QLUBI_ID}", "ALERT")
+
+            # Set alert cooldown
+            set_cooldown("alert", ALERT_COOLDOWN_TIME)
+            return True
+        else:
+            clean_print(f"MQTT publish failed with code: {result.rc}", "ERROR")
+            return False
+
+    except Exception as e:
+        clean_print(f"Send error: {e}", "ERROR")
+        return False
+
+
+def update_stats(new_bpm):
+    """Update statistics with new heart rate reading"""
+    global last_bpm, count_bpm, sum_bpm, avg_bpm, baseline_hr, baseline_established, is_calibrating, dynamic_baseline
+    global calibration_start_time
+
+    last_bpm = new_bpm
+
+    # Add to rolling stress samples
+    stress_samples.append(new_bpm)
+
+    # Always update statistics regardless of cooldown
+    # This ensures we have accurate averages for display
+    count_bpm += 1
+    sum_bpm += new_bpm
+    avg_bpm = sum_bpm / count_bpm
+
+    # Advanced baseline establishment (full 5 minutes)
+    if is_calibrating:
+        # Start calibration timer on first reading if not already started
+        if calibration_start_time == 0:
+            calibration_start_time = time.time()
+            clean_print("Calibration started - first reading received", "CALIBRATION")
+
+        baseline_samples.append(new_bpm)
+
+        current_time = time.time()
+        elapsed_time = current_time - calibration_start_time
+
+        # Check if we have both enough samples AND enough time (full 5 minutes)
+        samples_collected = len(baseline_samples)
+        time_completed = elapsed_time >= (CALIBRATION_MINUTES * 60)
+
+        if samples_collected >= CALIBRATION_SAMPLES and time_completed:
+            # Use median for baseline to be robust against outliers
+            sorted_samples = sorted(baseline_samples)
+            mid = len(sorted_samples) // 2
+            baseline_hr = sorted_samples[mid] if len(sorted_samples) % 2 == 1 else (sorted_samples[mid - 1] +
+                                                                                    sorted_samples[mid]) / 2
+            baseline_established = True
+            is_calibrating = False
+            dynamic_baseline = baseline_hr  # Initialize dynamic baseline
+
+            elapsed_minutes = elapsed_time / 60
+            clean_print(f"BASELINE ESTABLISHED: {baseline_hr:.1f} BPM", "SUCCESS")
+            clean_print(f"Calibration complete in {elapsed_minutes:.1f} minutes", "SUCCESS")
+            clean_print(f"Advanced monitoring now ACTIVE", "SUCCESS")
+
+            # Show dynamic baseline settings
+            clean_print(f"Dynamic baseline settings:", "INFO")
+            clean_print(f"  • Quiet threshold: ±{QUIET_THRESHOLD} BPM", "INFO")
+            clean_print(f"  • Update interval: {BASELINE_UPDATE_INTERVAL // 60} minutes", "INFO")
+            clean_print(f"  • Quiet samples needed: {MIN_QUIET_SAMPLES}", "INFO")
+            clean_print(f"  • Update weight: {DYNAMIC_BASELINE_WEIGHT * 100:.0f}%", "INFO")
+
+    # Check for quiet periods to update dynamic baseline
+    if baseline_established and not is_stressed:
+        check_quiet_period(new_bpm)
+
+
+def check_stress_advanced():
+    """Advanced stress detection using personalized thresholds"""
+    global stress_start_time, is_stressed
+
+    # CRITICAL FIX: This function should only be called when baseline is established
+    if not baseline_established:
+        return False
+
+    # Calculate current median HR (30-second window - shorter for quicker response)
+    if len(stress_samples) < 5:  # Need at least 5 samples (~30 seconds at 6s intervals)
+        return False
+
+    # Use shorter window for 30-second detection
+    current_window = list(stress_samples)[-5:]  # Last ~30 seconds
+    current_hr_median = sorted(current_window)[len(current_window) // 2]
+
+    # Get effective baseline (dynamic if available)
+    effective_baseline = get_effective_baseline()
+
+    # Check if thresholds are exceeded
+    absolute_exceeded = current_hr_median > (effective_baseline + ABSOLUTE_THRESHOLD)
+    relative_exceeded = current_hr_median > (effective_baseline * (1 + RELATIVE_THRESHOLD))
+
+    threshold_exceeded = absolute_exceeded or relative_exceeded
+
+    if threshold_exceeded and not is_stressed:
+        # Stress just started
+        stress_start_time = time.time()
+        is_stressed = True
+        clean_print(f"STRESS DETECTED: HR={current_hr_median:.1f}, Baseline={effective_baseline:.1f}", "WARNING")
+        clean_print(f"Need {MIN_DURATION_SECONDS}s sustained elevation for alert", "INFO")
+
+    elif threshold_exceeded and is_stressed:
+        # Stress ongoing, check duration
+        stress_duration = time.time() - stress_start_time
+
+        # Log progress every 10 seconds
+        if int(stress_duration) % 10 == 0 and stress_duration > 5:
+            remaining = MIN_DURATION_SECONDS - stress_duration
+            if remaining > 0:
+                clean_print(f"Stress ongoing: {stress_duration:.0f}/{MIN_DURATION_SECONDS}s", "WARNING")
+
+        if stress_duration >= MIN_DURATION_SECONDS:
+            # Reset stress state after triggering
+            is_stressed = False
+            clean_print(f"Stress duration reached: {stress_duration:.0f}s", "ALERT")
+            if verbose_logging:
+                clean_print(f"DEBUG: check_stress_advanced() returning True to trigger alert", "INFO")
+            return True
+
+    elif not threshold_exceeded and is_stressed:
+        # HR returned to normal before duration threshold
+        stress_duration = time.time() - stress_start_time
+        is_stressed = False
+        clean_print(f"HR returned to normal after {stress_duration:.0f}s", "INFO")
+
+    return False
+
+
+def check_alert():
+    """Check for stress using advanced detection - NO ALERTS DURING CALIBRATION"""
+
+    # CRITICAL FIX: Never send alerts during calibration!
+    if is_calibrating:
+        if verbose_logging:
+            clean_print(f"DEBUG: Skipping stress check - system is calibrating", "INFO")
+        return False
+
+    # Only use advanced detection after baseline is established
+    if not baseline_established:
+        if verbose_logging:
+            clean_print(f"DEBUG: Skipping stress check - baseline not established", "INFO")
+        return False
+
+    # Use the proper advanced stress detection
+    return check_stress_advanced()
+
+
+def process_heartrate_batch(bpm_values):
+    """Process a batch of heart rate values"""
+    global last_bpm
+
+    if not bpm_values:
+        return False
+
+    # Process all BPM values in the batch
+    for bpm in bpm_values:
+        if verbose_logging:
+            clean_print(f"Processing HR: {bpm} BPM", "DATA")
+        update_stats(bpm)
+
+    # Show status summary
+    display_status_summary()
+
+    # Check for distress after processing all values in batch
+    if check_alert():
+        # CRITICAL FIX: Actually send the distress signal!
+        if verbose_logging:
+            clean_print(f"DEBUG: check_alert() returned True, calling send_distress()", "INFO")
+        send_distress()
+        return True
+
+    return False
+
+
+# ============================================================================
+# FLASK ROUTES
+# ============================================================================
+
+@app.route('/heartrate', methods=['POST'])
+def receive_heartrate():
+    """Receive heart rate data in Sensor Logger format"""
+    data = request.get_json()
+
+    if verbose_logging:
+        clean_print(f"Received data packet", "DATA")
+
+    bpm_values = []
+
+    # Handle Sensor Logger format
+    if isinstance(data, dict) and 'payload' in data:
+        for record in data['payload']:
+            if isinstance(record, dict):
+                values = record.get('values', {})
+                if 'bpm' in values:
+                    bpm = values['bpm']
+                    bpm_values.append(bpm)
+                elif 'heart_rate' in values:
+                    bpm = values['heart_rate']
+                    bpm_values.append(bpm)
+
+    # Handle simple array format (backward compatibility)
+    elif isinstance(data, list) and len(data) > 0:
+        for item in data:
+            if isinstance(item, dict):
+                if 'bpm' in item:
+                    bpm_values.append(item['bpm'])
+                elif 'heart_rate' in item:
+                    bpm_values.append(item['heart_rate'])
+
+    # Handle single object format
+    elif isinstance(data, dict) and 'bpm' in data:
+        bpm_values.append(data['bpm'])
+
+    if bpm_values:
+        # Process the batch and check for stress
+        distress_triggered = process_heartrate_batch(bpm_values)
+
+        # Prepare response
+        effective_baseline = get_effective_baseline()
+        stress_duration = 0
+        if 'is_stressed' in globals() and is_stressed and stress_start_time > 0:
+            stress_duration = time.time() - stress_start_time
+
+        if distress_triggered:
+            return jsonify({
+                "status": "distress_sent",
+                "bpm": last_bpm,
+                "avg": round(avg_bpm, 1),
+                "baseline": round(effective_baseline, 1),
+                "static_baseline": round(baseline_hr, 1) if baseline_established else None,
+                "dynamic_baseline": round(dynamic_baseline, 1) if baseline_established else None,
+                "is_calibrating": is_calibrating,
+                "threshold": f"+{ABSOLUTE_THRESHOLD}BPM or +{RELATIVE_THRESHOLD * 100:.0f}%"
+            }), 200
+        else:
+            return jsonify({
+                "status": "monitoring",
+                "last_bpm": last_bpm,
+                "avg": round(avg_bpm, 1),
+                "baseline": round(effective_baseline, 1),
+                "static_baseline": round(baseline_hr, 1) if baseline_established else None,
+                "dynamic_baseline": round(dynamic_baseline, 1) if baseline_established else None,
+                "samples": count_bpm,
+                "is_calibrating": is_calibrating,
+                "is_stressed": is_stressed if 'is_stressed' in globals() else False,
+                "stress_duration": round(stress_duration, 1),
+                "stress_threshold": MIN_DURATION_SECONDS,
+                "baseline_progress": f"{len(baseline_samples)}/{CALIBRATION_SAMPLES} samples, {min(100, ((time.time() - calibration_start_time) / (CALIBRATION_MINUTES * 60)) * 100):.1f}% time" if is_calibrating and calibration_start_time > 0 else "waiting for data",
+                "quiet_samples": len(baseline_history),
+                "last_baseline_update": time.strftime('%H:%M:%S', time.localtime(
+                    last_baseline_update)) if last_baseline_update > 0 else "never",
+                "cooldown_active": cooldown_active,
+                "cooldown_type": cooldown_type,
+                "cooldown_remaining": int(max(0, cooldown_end - time.time())) if cooldown_active else 0
+            }), 200
+
+    if verbose_logging:
+        clean_print(f"No valid heart rate data found", "WARNING")
+    return jsonify({"error": "No valid heart rate data found"}), 400
+
+
+@app.route('/data', methods=['POST'])
+def receive_data():
+    """Alternative endpoint for /data (for compatibility)"""
+    if verbose_logging:
+        clean_print(f"Received data at /data endpoint", "DATA")
+
+    # Process the data
+    return receive_heartrate()
+
+
+@app.route('/test', methods=['POST'])
+def test_distress():
+    """Test distress signal"""
+    send_distress()
+    return jsonify({"status": "test_distress_sent"}), 200
+
+
+@app.route('/test_mqtt', methods=['GET'])
+def test_mqtt():
+    """Direct MQTT test endpoint"""
+    try:
+        if mqtt_client is None:
+            setup_mqtt()
+
+        payload = {
+            "test": True,
+            "message": "MQTT connection test",
+            "timestamp": time.time(),
+            "device_id": QLUBI_ID
+        }
+        result = mqtt_client.publish(MQTT_TOPIC_DISTRESS, json.dumps(payload), qos=1)
+        result.wait_for_publish()
+
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            clean_print(f"MQTT test message sent to {MQTT_TOPIC_DISTRESS}", "SUCCESS")
+            return jsonify({"status": "mqtt_test_sent", "topic": MQTT_TOPIC_DISTRESS}), 200
+        else:
+            clean_print(f"MQTT publish failed with code: {result.rc}", "ERROR")
+            return jsonify({"error": f"MQTT publish failed: {result.rc}"}), 500
+    except Exception as e:
+        clean_print(f"MQTT test failed: {e}", "ERROR")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/trigger_stress', methods=['POST'])
+def trigger_stress():
+    """Manually trigger a distress signal for testing"""
+    success = send_distress()
+    if success:
+        effective_baseline = get_effective_baseline()
+        return jsonify({
+            "status": "distress_triggered",
+            "message": "Distress signal sent manually",
+            "current_bpm": last_bpm,
+            "baseline": round(effective_baseline, 1)
+        }), 200
+    else:
+        return jsonify({
+            "status": "cooldown_active",
+            "message": "Cannot send distress - cooldown active",
+            "cooldown_type": cooldown_type,
+            "cooldown_remaining": int(max(0, cooldown_end - time.time())) if cooldown_active else 0
+        }), 429
+
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get current status"""
+    cooldown_remaining = 0
+    if cooldown_active:
+        cooldown_remaining = max(0, cooldown_end - time.time())
+
+    stress_duration = 0
+    if 'is_stressed' in globals() and is_stressed and stress_start_time > 0:
+        stress_duration = time.time() - stress_start_time
+
+    # Calculate current thresholds
+    effective_baseline = get_effective_baseline()
+    stress_threshold_abs = None
+    stress_threshold_rel = None
+    if baseline_established:
+        stress_threshold_abs = round(effective_baseline + ABSOLUTE_THRESHOLD, 1)
+        stress_threshold_rel = round(effective_baseline * (1 + RELATIVE_THRESHOLD), 1)
+
+    return jsonify({
+        "device_id": QLUBI_ID,
+        "current_bpm": last_bpm,
+        "avg_bpm": round(avg_bpm, 1),
+        "static_baseline": round(baseline_hr, 1) if baseline_established else None,
+        "dynamic_baseline": round(dynamic_baseline, 1) if baseline_established else None,
+        "effective_baseline": round(effective_baseline, 1),
+        "samples": count_bpm,
+        "baseline_established": baseline_established,
+        "is_calibrating": is_calibrating,
+        "is_stressed": is_stressed if 'is_stressed' in globals() else False,
+        "stress_duration_sec": round(stress_duration, 1),
+        "stress_threshold_sec": MIN_DURATION_SECONDS,
+        "stress_threshold_abs": stress_threshold_abs,
+        "stress_threshold_rel": stress_threshold_rel,
+        "stress_progress": f"{round(stress_duration, 0)}/{MIN_DURATION_SECONDS}s" if is_stressed else "not active",
+        "cooldown_active": cooldown_active,
+        "cooldown_type": cooldown_type,
+        "cooldown_remaining": int(cooldown_remaining),
+        "mqtt_connected": mqtt_client is not None,
+        "quiet_period_tracking": {
+            "quiet_samples": len(baseline_history),
+            "samples_needed": MIN_QUIET_SAMPLES,
+            "last_update": time.strftime('%H:%M:%S',
+                                         time.localtime(last_baseline_update)) if last_baseline_update > 0 else "never",
+            "update_interval_sec": BASELINE_UPDATE_INTERVAL
+        },
+        "stress_detection_config": {
+            "absolute_threshold": ABSOLUTE_THRESHOLD,
+            "relative_threshold": RELATIVE_THRESHOLD,
+            "min_duration": MIN_DURATION_SECONDS,
+            "calibration_minutes": CALIBRATION_MINUTES,
+            "calibration_samples": CALIBRATION_SAMPLES,
+            "dynamic_baseline_weight": DYNAMIC_BASELINE_WEIGHT,
+            "quiet_threshold": QUIET_THRESHOLD,
+            "alert_cooldown_minutes": ALERT_COOLDOWN_TIME // 60
+        }
+    }), 200
+
+
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Reset statistics and baseline"""
+    global count_bpm, sum_bpm, avg_bpm, calibration_start_time
+    global baseline_established, baseline_hr, is_calibrating, stress_start_time, is_stressed
+    global dynamic_baseline, baseline_history, last_baseline_update
+
+    count_bpm = 0
+    sum_bpm = 0
+    avg_bpm = last_bpm
+
+    # Reset advanced tracking
+    baseline_samples.clear()
+    stress_samples.clear()
+    baseline_established = False
+    baseline_hr = last_bpm
+    is_calibrating = True
+    calibration_start_time = 0  # Reset to 0, will start on next reading
+    stress_start_time = 0
+    is_stressed = False
+
+    # Reset dynamic baseline
+    dynamic_baseline = last_bpm
+    baseline_history.clear()
+    last_baseline_update = 0
+
+    clean_print("System reset - waiting for first reading to start calibration", "INFO")
+    return jsonify({"status": "reset"}), 200
+
+
+@app.route('/force_baseline', methods=['POST'])
+def force_baseline():
+    """Force a new baseline calculation from recent samples"""
+    global baseline_hr, baseline_established, is_calibrating, dynamic_baseline
+
+    if len(stress_samples) >= 10:
+        sorted_samples = sorted(stress_samples)
+        mid = len(sorted_samples) // 2
+        baseline_hr = sorted_samples[mid] if len(sorted_samples) % 2 == 1 else (sorted_samples[mid - 1] +
+                                                                                sorted_samples[mid]) / 2
+        baseline_established = True
+        is_calibrating = False
+        dynamic_baseline = baseline_hr  # Reset dynamic baseline too
+
+        # Clear calibration samples since we're using recent data
+        baseline_samples.clear()
+        baseline_history.clear()  # Clear dynamic baseline history
+
+        clean_print(f"Baseline forced to {baseline_hr:.1f} BPM", "SUCCESS")
+
+        return jsonify({
+            "status": "baseline_forced",
+            "baseline_bpm": round(baseline_hr, 1),
+            "dynamic_baseline": round(dynamic_baseline, 1),
+            "samples_used": len(stress_samples)
+        }), 200
+    else:
+        return jsonify({
+            "status": "insufficient_data",
+            "samples_available": len(stress_samples),
+            "samples_needed": 10
+        }), 400
+
+
+@app.route('/reset_dynamic_baseline', methods=['POST'])
+def reset_dynamic_baseline():
+    """Reset only the dynamic baseline to match static baseline"""
+    global dynamic_baseline, baseline_history, last_baseline_update
+
+    if baseline_established:
+        dynamic_baseline = baseline_hr
+        baseline_history.clear()
+        last_baseline_update = time.time()
+
+        clean_print(f"Dynamic baseline reset to static baseline: {dynamic_baseline:.1f} BPM", "INFO")
+
+        return jsonify({
+            "status": "dynamic_baseline_reset",
+            "static_baseline": round(baseline_hr, 1),
+            "dynamic_baseline": round(dynamic_baseline, 1)
+        }), 200
+    else:
+        return jsonify({
+            "status": "no_static_baseline",
+            "message": "Static baseline not established yet"
+        }), 400
+
+
+def cleanup():
+    send_qlubi_offline()
+    if mqtt_client:
+        mqtt_client.loop_stop()
+
+
+atexit.register(cleanup)
+
+
+def signal_handler(sig, frame):
+    print("\nShutting down...")
+    cleanup()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+if __name__ == '__main__':
+    # Don't start calibration timer yet - wait for first reading
+    calibration_start_time = 0  # Will be set when first reading arrives
+
+    # Import statistics (already imported at top, but ensure it's available)
+    try:
+        import statistics
+    except ImportError:
+        # Fallback for simple median calculation
+        def median(lst):
+            n = len(lst)
+            s = sorted(lst)
+            return (s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2)
+
+
+        statistics.median = median
+
+    # Start MQTT
+    setup_mqtt()
+    send_qlubi_online()
+
+    # Clean startup display
+    print("\n" + "=" * 60)
+    print("❤️  QLUBI HEART MONITOR v2.0 - FIXED NO CALIBRATION ALERTS")
+    print("=" * 60)
+    print(f"Device ID: {QLUBI_ID}")
+    print(f"Server: {SERVER_HOST}:{SERVER_PORT}")
+    print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+    print(f"Verbose logging: {verbose_logging}")
+    print("=" * 60)
+    print("📊 CALIBRATION SETTINGS:")
+    print(f"  • Duration: {CALIBRATION_MINUTES} minutes (full time required)")
+    print(f"  • Target samples: {CALIBRATION_SAMPLES}")
+    print(f"  • Timer starts on FIRST HEART RATE READING")
+    print(f"  • NO ALERTS DURING CALIBRATION")
+    print("=" * 60)
+    print("📈 DYNAMIC BASELINE SETTINGS:")
+    print(f"  • Quiet threshold: ±{QUIET_THRESHOLD} BPM (looser)")
+    print(f"  • Update interval: {BASELINE_UPDATE_INTERVAL // 60} minutes (faster)")
+    print(f"  • Quiet samples needed: {MIN_QUIET_SAMPLES} (fewer)")
+    print(f"  • Update weight: {DYNAMIC_BASELINE_WEIGHT * 100:.0f}% (higher)")
+    print(f"  • Max change: {MAX_BASELINE_CHANGE} BPM (larger)")
+    print("=" * 60)
+    print("🚨 STRESS DETECTION & COOLDOWN:")
+    print(f"  • Absolute threshold: +{ABSOLUTE_THRESHOLD} BPM")
+    print(f"  • Relative threshold: +{RELATIVE_THRESHOLD * 100:.0f}%")
+    print(f"  • Alert duration: {MIN_DURATION_SECONDS} seconds")
+    print(f"  • Alert cooldown: {ALERT_COOLDOWN_TIME // 60} minutes")
+    print("=" * 60)
+    print("🔧 DEBUG ENDPOINTS:")
+    print(f"  • GET /status - Check system status")
+    print(f"  • GET /test_mqtt - Test MQTT connection")
+    print(f"  • POST /trigger_stress - Manually trigger distress")
+    print(f"  • POST /test - Test distress signal")
+    print(f"  • POST /force_baseline - Force baseline recalculation")
+    print("=" * 60)
+    clean_print("Waiting for first heart rate reading to start calibration...", "CALIBRATION")
+    print("=" * 60)
+
+    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)
